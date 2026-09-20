@@ -1,0 +1,6 @@
+{
+  "name": "Deriv DBot Pro - Free Bots & DCircles Digit Analyzer",
+  "description": "Automated trading bot builder with visual block editor, free premium strategy bots, live 1000-tick DCircles digit analyzer, and market analysis tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
