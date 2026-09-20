@@ -59,3 +59,20 @@ export interface JournalLog {
   type: 'info' | 'success' | 'warn' | 'error';
   message: string;
 }
+
+export interface DerivAccount {
+  account: string;
+  token: string;
+  currency: string;
+  isVirtual: boolean;
+}
+
+export interface DerivAuthUser {
+  loginid: string;
+  balance: number;
+  currency: string;
+  email?: string;
+  isVirtual: boolean;
+  token: string;
+  accounts: DerivAccount[];
+}

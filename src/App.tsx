@@ -8,7 +8,7 @@ import { Dashboard } from './components/Dashboard';
 import { Tutorials } from './components/Tutorials';
 import { FREE_BOTS } from './data/freeBots';
 import { ALL_MARKETS } from './data/markets';
-import { BotStrategy, TradeContract, JournalLog, TickData } from './types';
+import { BotStrategy, TradeContract, JournalLog, TickData, DerivAuthUser, DerivAccount } from './types';
 import { derivWsService, playSoundNotification } from './services/derivWs';
 
 export default function App() {
@@ -16,6 +16,9 @@ export default function App() {
   const [activeStrategy, setActiveStrategy] = useState<BotStrategy>(FREE_BOTS[0]);
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [balance, setBalance] = useState<number>(10000.0);
+  const [currency, setCurrency] = useState<string>('USD');
+  const [authUser, setAuthUser] = useState<DerivAuthUser | null>(() => derivWsService.getCurrentUser());
+  const [appId, setAppId] = useState<string>(() => derivWsService.getAppId());
   const [totalProfit, setTotalProfit] = useState<number>(0);
   const [winCount, setWinCount] = useState<number>(0);
   const [lossCount, setLossCount] = useState<number>(0);
@@ -51,6 +54,27 @@ export default function App() {
       setConnectionStatus(status);
     });
     return () => unsub();
+  }, []);
+
+  // Track Deriv Authentication & User Balance
+  useEffect(() => {
+    const unsubAuth = derivWsService.onAuthChange((user) => {
+      setAuthUser(user);
+      if (user) {
+        setBalance(user.balance);
+        setCurrency(user.currency || 'USD');
+        addLog(`Deriv Authenticated: ${user.loginid} (${user.isVirtual ? 'Virtual' : 'Real'}) | Balance: $${user.balance.toFixed(2)} ${user.currency}`, 'success');
+      }
+    });
+
+    const unsubAuthError = derivWsService.onAuthError((errMsg) => {
+      addLog(`Deriv Auth Error: ${errMsg}`, 'error');
+    });
+
+    return () => {
+      unsubAuth();
+      unsubAuthError();
+    };
   }, []);
 
   // Helper log function
@@ -283,6 +307,35 @@ export default function App() {
     }
   };
 
+  // Deriv Authentication Handlers
+  const handleLogin = () => {
+    derivWsService.login(appId);
+  };
+
+  const handleLogout = () => {
+    derivWsService.logout();
+    setAuthUser(null);
+    setBalance(10000);
+    setCurrency('USD');
+    addLog('Logged out from Deriv. Switched to guest mode.', 'info');
+  };
+
+  const handleSwitchAccount = (account: DerivAccount) => {
+    derivWsService.switchAccount(account);
+    addLog(`Switching to Deriv account ${account.account}...`, 'info');
+  };
+
+  const handleSetManualToken = (token: string) => {
+    derivWsService.setManualToken(token);
+    addLog('Authenticating with manual Deriv API token...', 'info');
+  };
+
+  const handleUpdateAppId = (newAppId: string) => {
+    derivWsService.setAppId(newAppId);
+    setAppId(newAppId);
+    addLog(`Deriv App ID updated to ${newAppId}`, 'info');
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#f0f4f9] via-[#e8eff8] to-[#f4f7fc] text-slate-800 flex flex-col font-sans pb-10">
       {/* Top Header */}
@@ -292,11 +345,18 @@ export default function App() {
         isRunning={isRunning}
         onToggleRun={handleToggleRun}
         balance={balance}
-        currency="USD"
+        currency={currency}
         isAudioEnabled={isAudioEnabled}
         onToggleAudio={() => setIsAudioEnabled(!isAudioEnabled)}
         connectionStatus={connectionStatus}
         activeBotName={activeStrategy.name}
+        authUser={authUser}
+        onLogin={handleLogin}
+        onLogout={handleLogout}
+        onSwitchAccount={handleSwitchAccount}
+        onSetManualToken={handleSetManualToken}
+        appId={appId}
+        onUpdateAppId={handleUpdateAppId}
       />
 
       {/* Main View Container */}

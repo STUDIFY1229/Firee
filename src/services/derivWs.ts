@@ -1,21 +1,176 @@
-import { TickData } from '../types';
+import { TickData, DerivAccount, DerivAuthUser } from '../types';
 
 type TickCallback = (tick: TickData, ticksHistory: TickData[]) => void;
 type ConnectionCallback = (status: 'connected' | 'disconnected' | 'simulated') => void;
+type AuthCallback = (user: DerivAuthUser | null) => void;
+type AuthErrorCallback = (error: string) => void;
 
 class DerivWebSocketService {
   private ws: WebSocket | null = null;
   private currentSymbol = 'R_100';
   private tickListeners: Set<TickCallback> = new Set();
   private connectionListeners: Set<ConnectionCallback> = new Set();
+  private authListeners: Set<AuthCallback> = new Set();
+  private authErrorListeners: Set<AuthErrorCallback> = new Set();
   private ticksHistory: TickData[] = [];
   private isConnected = false;
   private isSimulated = false;
   private simulationInterval: number | null = null;
   private reconnectTimer: number | null = null;
+  private activeToken: string | null = null;
+  private currentUser: DerivAuthUser | null = null;
 
   constructor() {
+    this.checkOAuthCallback();
     this.initWebSocket();
+  }
+
+  public getAppId(): string {
+    if (typeof window === 'undefined') return '1089';
+    return localStorage.getItem('deriv_app_id') || '1089';
+  }
+
+  public setAppId(id: string) {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('deriv_app_id', id.trim());
+    // Re-initialize WebSocket with new App ID
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch (e) {
+        // ignore
+      }
+    }
+    this.initWebSocket();
+  }
+
+  public getStoredAccounts(): DerivAccount[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem('deriv_accounts');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  public checkOAuthCallback(): boolean {
+    if (typeof window === 'undefined') return false;
+
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const accounts: DerivAccount[] = [];
+      let i = 1;
+
+      while (params.has(`acct${i}`) && params.has(`token${i}`)) {
+        const acct = params.get(`acct${i}`)!;
+        const token = params.get(`token${i}`)!;
+        const cur = params.get(`cur${i}`) || 'USD';
+        accounts.push({
+          account: acct,
+          token,
+          currency: cur,
+          isVirtual: acct.startsWith('VRTC'),
+        });
+        i++;
+      }
+
+      if (accounts.length > 0) {
+        localStorage.setItem('deriv_accounts', JSON.stringify(accounts));
+        localStorage.setItem('deriv_active_token', accounts[0].token);
+        localStorage.setItem('deriv_active_account', accounts[0].account);
+        this.activeToken = accounts[0].token;
+
+        // Clean query parameters from URL so tokens are not exposed in browser address bar
+        const cleanUrl = window.location.origin + window.location.pathname;
+        window.history.replaceState({}, document.title, cleanUrl);
+        return true;
+      }
+
+      // Check stored token
+      const storedToken = localStorage.getItem('deriv_active_token');
+      if (storedToken) {
+        this.activeToken = storedToken;
+      }
+    } catch (err) {
+      console.error('Error checking OAuth callback:', err);
+    }
+    return false;
+  }
+
+  public login(customAppId?: string) {
+    if (typeof window === 'undefined') return;
+    const appId = customAppId || this.getAppId();
+    const oauthUrl = `https://oauth.deriv.com/oauth2/authorize?app_id=${appId}&l=EN&brand=deriv`;
+    window.location.href = oauthUrl;
+  }
+
+  public logout() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({ logout: 1 }));
+      } catch (e) {
+        // ignore
+      }
+    }
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('deriv_accounts');
+      localStorage.removeItem('deriv_active_token');
+      localStorage.removeItem('deriv_active_account');
+    }
+    this.activeToken = null;
+    this.currentUser = null;
+    this.notifyAuth(null);
+  }
+
+  public switchAccount(account: DerivAccount) {
+    this.activeToken = account.token;
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('deriv_active_token', account.token);
+      localStorage.setItem('deriv_active_account', account.account);
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ authorize: account.token }));
+    }
+  }
+
+  public setManualToken(token: string, accountName: string = 'CR_CUSTOM') {
+    const trimmed = token.trim();
+    if (!trimmed) return;
+    this.activeToken = trimmed;
+    const account: DerivAccount = {
+      account: accountName,
+      token: trimmed,
+      currency: 'USD',
+      isVirtual: accountName.startsWith('VRTC'),
+    };
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('deriv_accounts', JSON.stringify([account]));
+      localStorage.setItem('deriv_active_token', trimmed);
+      localStorage.setItem('deriv_active_account', accountName);
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ authorize: trimmed }));
+    }
+  }
+
+  public getCurrentUser(): DerivAuthUser | null {
+    return this.currentUser;
+  }
+
+  public onAuthChange(callback: AuthCallback) {
+    this.authListeners.add(callback);
+    callback(this.currentUser);
+    return () => {
+      this.authListeners.delete(callback);
+    };
+  }
+
+  public onAuthError(callback: AuthErrorCallback) {
+    this.authErrorListeners.add(callback);
+    return () => {
+      this.authErrorListeners.delete(callback);
+    };
   }
 
   public subscribeTicks(symbol: string, callback: TickCallback) {
@@ -81,13 +236,19 @@ class DerivWebSocketService {
     if (typeof window === 'undefined') return;
 
     try {
-      this.ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+      const appId = this.getAppId();
+      this.ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
 
       this.ws.onopen = () => {
         this.isConnected = true;
         this.isSimulated = false;
         this.stopSimulation();
         this.notifyConnection('connected');
+
+        // Authorize if active token exists
+        if (this.activeToken) {
+          this.ws?.send(JSON.stringify({ authorize: this.activeToken }));
+        }
 
         // Request 1000 ticks history and live subscription for current symbol
         this.ws?.send(
@@ -104,7 +265,50 @@ class DerivWebSocketService {
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.msg_type === 'history') {
+
+          // Handle Deriv OAuth Authorize response
+          if (data.msg_type === 'authorize') {
+            const auth = data.authorize;
+            if (auth) {
+              const accounts = this.getStoredAccounts();
+              const user: DerivAuthUser = {
+                loginid: auth.loginid,
+                balance: typeof auth.balance === 'number' ? auth.balance : 10000,
+                currency: auth.currency || 'USD',
+                email: auth.email,
+                isVirtual: Boolean(auth.is_virtual),
+                token: this.activeToken || '',
+                accounts: accounts.length > 0 ? accounts : [
+                  {
+                    account: auth.loginid,
+                    token: this.activeToken || '',
+                    currency: auth.currency || 'USD',
+                    isVirtual: Boolean(auth.is_virtual),
+                  },
+                ],
+              };
+              this.currentUser = user;
+              this.notifyAuth(user);
+
+              // Subscribe to real-time balance
+              this.ws?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+            }
+          } else if (data.msg_type === 'balance') {
+            if (this.currentUser && data.balance) {
+              this.currentUser = {
+                ...this.currentUser,
+                balance: data.balance.balance,
+                currency: data.balance.currency || this.currentUser.currency,
+              };
+              this.notifyAuth(this.currentUser);
+            }
+          } else if (data.error && data.echo_req && data.echo_req.authorize) {
+            console.warn('Deriv authorization rejected:', data.error.message);
+            this.notifyAuthError(data.error.message || 'Deriv authorization failed');
+            if (data.error.code === 'InvalidToken' || data.error.code === 'AuthorizationRequired') {
+              this.logout();
+            }
+          } else if (data.msg_type === 'history') {
             const history = data.history;
             if (history && Array.isArray(history.prices)) {
               this.ticksHistory = history.prices.map((p: number, index: number) => {
@@ -238,6 +442,14 @@ class DerivWebSocketService {
 
   private notifyConnection(status: 'connected' | 'disconnected' | 'simulated') {
     this.connectionListeners.forEach((cb) => cb(status));
+  }
+
+  private notifyAuth(user: DerivAuthUser | null) {
+    this.authListeners.forEach((cb) => cb(user));
+  }
+
+  private notifyAuthError(err: string) {
+    this.authErrorListeners.forEach((cb) => cb(err));
   }
 }
 
